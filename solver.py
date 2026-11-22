@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any
 
@@ -612,6 +613,7 @@ def solve_activity(
     activity_url: str,
     title: str = "",
     quiet_logs: bool = False,
+    activity_budget_sec: float = 0.0,
 ) -> tuple[int, int] | None:
     """Open one Cambridge One activity, solve every step at 100%, and verify completion.
 
@@ -779,8 +781,18 @@ def solve_activity(
                 _solve_choices(driver, step_idx, spec["choices"])
 
             verify_step_ready_before_check(driver, step_idx, spec)
+            if activity_budget_sec > 0 and scorable_count > 0:
+                step_base = activity_budget_sec / scorable_count
+                pre_check_wait = random.uniform(step_base * 0.45, step_base * 0.95)
+                post_check_wait = random.uniform(step_base * 0.15, step_base * 0.45)
+                time.sleep(max(0.2, pre_check_wait))
+            else:
+                post_check_wait = 0.0
+
             _click_outer_button(driver, 'a.btn.green-btn[title="Check"]')
             verify_step_100_after_check(driver, step_idx)
+            if post_check_wait > 0:
+                time.sleep(max(0.15, post_check_wait))
             _click_outer_button(driver, 'a.btn.green-btn[title="Next"]')
 
             # Wait briefly for transition to next step or completion view.

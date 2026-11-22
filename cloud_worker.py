@@ -229,6 +229,8 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
             headless=True,
             quiet_logs=True,
             on_progress=_on_progress,
+            min_total_minutes=20.0,
+            max_total_minutes=40.0,
         )
         final_total = ASSIGNMENT_TOTAL if scope == "assignments" else max(summary.get("total", 0), 1)
         now = _now_ms()

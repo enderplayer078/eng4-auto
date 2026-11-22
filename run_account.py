@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 import shutil
 import sys
 from typing import Callable
@@ -28,6 +29,34 @@ def _parse_units(raw_units: list[str] | None) -> list[int] | None:
     return sorted(units) if units else None
 
 
+def _build_activity_budgets(
+    targets: list,
+    min_total_minutes: float,
+    max_total_minutes: float,
+) -> list[float]:
+    """Allocate randomized per-activity pacing budgets targeting 20-40 min total for 40 items."""
+    count = len(targets)
+    if count == 0 or max_total_minutes <= 0:
+        return [0.0] * count
+
+    low = max(0.0, min(min_total_minutes, max_total_minutes))
+    high = max(low, max_total_minutes)
+    target_full_sec = random.uniform(low, high) * 60.0
+    # Scale proportionally when fewer/more than 40 activities are queued
+    scaled_total_sec = target_full_sec * (count / 40.0)
+    # Subtract ~7s natural browser/load overhead per activity
+    pacing_pool_sec = max(0.0, scaled_total_sec - (count * 7.0))
+    if pacing_pool_sec <= 0:
+        return [0.0] * count
+
+    weights: list[float] = []
+    for t in targets:
+        base_w = 1.35 if getattr(t, "lesson", "") == "D" else 1.0
+        weights.append(base_w * random.uniform(0.8, 1.2))
+    weight_sum = sum(weights) or 1.0
+    return [pacing_pool_sec * (w / weight_sum) for w in weights]
+
+
 def run_for_account(
     username: str,
     password: str,
@@ -38,6 +67,8 @@ def run_for_account(
     headless: bool = True,
     quiet_logs: bool = False,
     on_progress: Callable[[int, int], None] | None = None,
+    min_total_minutes: float = 20.0,
+    max_total_minutes: float = 40.0,
 ) -> dict[str, int]:
     """Log into Cambridge One and complete all target activities at 100%."""
     session_dir = build_session_dir(username)
@@ -74,12 +105,15 @@ def run_for_account(
         if on_progress:
             on_progress(0, total)
 
-        for idx, target in enumerate(targets, start=1):
+        budgets = _build_activity_budgets(targets, min_total_minutes, max_total_minutes)
+
+        for idx, (target, budget_sec) in enumerate(zip(targets, budgets), start=1):
             result = solve_activity(
                 driver=driver,
                 activity_url=target.activity_url,
                 title="" if quiet_logs else f"Unit {target.unit_num} {target.lesson}: {target.title}",
                 quiet_logs=quiet_logs,
+                activity_budget_sec=budget_sec,
             )
             if result is None:
                 skipped += 1
@@ -147,6 +181,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Suppress activity titles and verbose logs",
     )
+    parser.add_argument(
+        "--min-minutes",
+        type=float,
+        default=20.0,
+        help="Minimum randomized total pacing time in minutes for 40 items (0 to disable)",
+    )
+    parser.add_argument(
+        "--max-minutes",
+        type=float,
+        default=40.0,
+        help="Maximum randomized total pacing time in minutes for 40 items (0 to disable)",
+    )
 
     args = parser.parse_args(argv)
     units = _parse_units(args.units)
@@ -160,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
         include_completed=args.include_completed,
         headless=args.headless,
         quiet_logs=args.quiet,
+        min_total_minutes=args.min_minutes,
+        max_total_minutes=args.max_minutes,
     )
     print(
         f"[runner] Done: completed={summary['completed']}, "
