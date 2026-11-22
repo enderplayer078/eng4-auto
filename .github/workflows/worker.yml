@@ -1,0 +1,50 @@
+name: ENG4 Cloud Chrome Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eng4-cloud-worker
+  cancel-in-progress: false
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Enable native Chrome user-namespace sandbox (Ubuntu 24.04)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Verify Google Chrome availability
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb
+            rm -f google-chrome-stable_current_amd64.deb
+          fi
+          google-chrome --version
+
+      - name: Install pinned Python dependencies
+        run: python -m pip install --no-cache-dir -r requirements.txt
+
+      - name: Run Cloud Chrome Worker
+        env:
+          FIREBASE_RTDB_BASE: ${{ secrets.FIREBASE_RTDB_BASE }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          RSA_PRIVATE_KEY: ${{ secrets.RSA_PRIVATE_KEY }}
+        run: python cloud_worker.py

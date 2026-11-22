@@ -1,0 +1,19 @@
+# Local-only web, backend & Firebase config (keep separated from Public GitHub Repo)
+index.html
+styles.css
+app.js
+firebase.json
+.firebaserc
+database.rules.json
+robots.txt
+functions/
+
+# Runtime sessions, environment secrets & caches
+.sessions/
+.env
+.env.*
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
