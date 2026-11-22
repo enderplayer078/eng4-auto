@@ -251,8 +251,8 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
     raw_min = ticket.get("minMinutes", 20.0)
     raw_max = ticket.get("maxMinutes", 40.0)
     try:
-        min_minutes = max(0.0, min(195.0, float(raw_min)))
-        max_minutes = max(min_minutes, min(195.0, float(raw_max)))
+        min_minutes = max(0.0, min(135.0, float(raw_min)))
+        max_minutes = max(min_minutes, min(135.0, float(raw_max)))
     except (TypeError, ValueError):
         min_minutes, max_minutes = 20.0, 40.0
 
