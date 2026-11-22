@@ -4,6 +4,7 @@ styles.css
 app.js
 firebase.json
 .firebaserc
+.firebase/
 database.rules.json
 robots.txt
 functions/

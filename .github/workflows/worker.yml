@@ -6,14 +6,10 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: eng4-cloud-worker
-  cancel-in-progress: false
-
 jobs:
   run-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository

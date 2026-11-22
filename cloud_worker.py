@@ -88,6 +88,31 @@ class RTDBClient:
         resp = self._session.delete(self._url(path), headers=self._headers(), timeout=20)
         resp.raise_for_status()
 
+    def atomic_pop(self, path: str) -> Any | None:
+        """Atomically read and delete a node using Firebase RTDB ETag CAS.
+
+        Returns the node value if this worker won exclusive claim (HTTP 200),
+        or None if another parallel runner already claimed it (HTTP 412).
+        """
+        url = self._url(path)
+        r = self._session.get(
+            url, headers=self._headers({"X-Firebase-ETag": "true"}), timeout=20
+        )
+        r.raise_for_status()
+        etag = r.headers.get("ETag")
+        val = r.json()
+        if val is None or not etag or etag == "null_etag":
+            return None
+        d = self._session.delete(
+            url, headers=self._headers({"If-Match": etag}), timeout=20
+        )
+        if d.status_code == 200:
+            return val
+        if d.status_code == 412:
+            return None
+        d.raise_for_status()
+        return None
+
     def increment_completed_count(self) -> None:
         """Atomically increment public/stats/completedCount using ETag CAS."""
         url = self._url("public/stats/completedCount")
@@ -143,7 +168,7 @@ def _now_ms() -> int:
 
 
 def _claim_next_job(db: RTDBClient) -> tuple[str, dict[str, Any]] | None:
-    """Fetch FIFO verified ticket from private/inbox and delete it immediately."""
+    """Atomically claim one FIFO verified ticket from private/inbox (parallel-safe)."""
     inbox = db.get("private/inbox")
     if not isinstance(inbox, dict) or not inbox:
         return None
@@ -152,9 +177,11 @@ def _claim_next_job(db: RTDBClient) -> tuple[str, dict[str, Any]] | None:
         inbox.items(),
         key=lambda kv: int((kv[1] or {}).get("createdAt", 0)) if isinstance(kv[1], dict) else 0,
     )
-    for job_id, ticket in ordered:
-        # Delete ticket immediately upon inspection/claim so ciphertext never lingers.
-        db.delete(f"private/inbox/{job_id}")
+    for job_id, _preview in ordered:
+        ticket = db.atomic_pop(f"private/inbox/{job_id}")
+        if ticket is None:
+            # Already claimed by a parallel runner
+            continue
         if not isinstance(ticket, dict):
             continue
         if ticket.get("verified") is not True:
@@ -221,6 +248,14 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
         except Exception:
             pass
 
+    raw_min = ticket.get("minMinutes", 20.0)
+    raw_max = ticket.get("maxMinutes", 40.0)
+    try:
+        min_minutes = max(0.0, min(195.0, float(raw_min)))
+        max_minutes = max(min_minutes, min(195.0, float(raw_max)))
+    except (TypeError, ValueError):
+        min_minutes, max_minutes = 20.0, 40.0
+
     try:
         summary = run_for_account(
             username=username,
@@ -229,8 +264,8 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
             headless=True,
             quiet_logs=True,
             on_progress=_on_progress,
-            min_total_minutes=20.0,
-            max_total_minutes=40.0,
+            min_total_minutes=min_minutes,
+            max_total_minutes=max_minutes,
         )
         final_total = ASSIGNMENT_TOTAL if scope == "assignments" else max(summary.get("total", 0), 1)
         now = _now_ms()
@@ -300,6 +335,7 @@ def main() -> int:
     db = RTDBClient(rtdb_base, sa_info)
 
     processed = 0
+    run_start = time.monotonic()
     while processed < MAX_JOBS_PER_RUN:
         claimed = _claim_next_job(db)
         if claimed is None:
@@ -309,6 +345,10 @@ def main() -> int:
         processed += 1
         print(f"[worker] Processing queued job #{processed}")
         _process_job(db, private_key, job_id, ticket)
+        # In parallel mode each dispatch runs its own runner; only drain additional
+        # waiting tickets if this runner has been alive for < 15 minutes.
+        if (time.monotonic() - run_start) >= 900.0:
+            break
 
     print(f"[worker] Worker run finished (processed={processed})")
     return 0
