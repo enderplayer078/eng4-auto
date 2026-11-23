@@ -44,8 +44,10 @@ def _build_activity_budgets(
     target_full_sec = random.uniform(low, high) * 60.0
     # Scale proportionally when fewer/more than 40 activities are queued
     scaled_total_sec = target_full_sec * (count / 40.0)
-    # Subtract ~7s natural browser/load overhead per activity
-    pacing_pool_sec = max(0.0, scaled_total_sec - (count * 7.0))
+    # Cambridge One records active time in 10s floor ticks (accTimeUnit=10) only
+    # after the activity iframe launches (~3.5s active solve/check overhead vs
+    # ~5.0s average floor quantization loss -> +1.5s compensation per activity).
+    pacing_pool_sec = max(0.0, scaled_total_sec + (count * 1.5))
     if pacing_pool_sec <= 0:
         return [0.0] * count
 

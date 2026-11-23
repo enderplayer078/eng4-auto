@@ -608,6 +608,76 @@ def _click_outer_button(driver: WebDriver, css_selector: str, timeout: float = 1
     btn.click()
 
 
+def _paced_sleep(driver: WebDriver, duration_sec: float) -> None:
+    """Sleep for duration_sec while emitting periodic mousemove heartbeats.
+
+    Cambridge One's active_time_worker.js pauses time tracking after 120s of
+    DOM inactivity (inactiveUserTimeThreshold=120). Emitting a lightweight
+    mousemove on the outer document every ~12-18s resets inactiveUserTime to 0
+    so long pacing modes (60-120 min) record 100% of their elapsed time.
+    """
+    if duration_sec <= 0:
+        return
+    deadline = time.monotonic() + duration_sec
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        chunk = min(remaining, random.uniform(12.0, 18.0))
+        time.sleep(chunk)
+        if deadline - time.monotonic() > 1.0:
+            try:
+                driver.switch_to.default_content()
+                x = random.randint(120, 960)
+                y = random.randint(120, 640)
+                driver.execute_script(
+                    "document.dispatchEvent(new MouseEvent('mousemove', "
+                    "{bubbles: true, cancelable: true, clientX: arguments[0], clientY: arguments[1]}));",
+                    x,
+                    y,
+                )
+            except Exception:
+                pass
+
+
+def _close_activity_cleanly(driver: WebDriver, timeout: float = 15.0) -> bool:
+    """Click the outer Close Activity (x) button so Angular flushes xAPI timespent.
+
+    Cambridge One accumulates active time in localStorage in 10s ticks and only
+    publishes it every 60s OR during Angular's canDeactivate() guard
+    (closeLO -> publishSavedResults -> flushStateAndStatements). Hard-navigating
+    with driver.get() skips canDeactivate() and drops un-flushed timespent.
+    """
+    try:
+        driver.switch_to.default_content()
+        clicked = driver.execute_script(
+            """
+            const btn = document.querySelector(
+                'button[qid="cHeader-8"], button[aria-label="Close Activity"]'
+            );
+            if (btn && btn.offsetParent !== null) {
+                btn.click();
+                return true;
+            }
+            return false;
+            """
+        )
+        if not clicked:
+            time.sleep(1.5)
+            return False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if "/view/item/" not in (driver.current_url or ""):
+                time.sleep(0.4)
+                return True
+            time.sleep(0.25)
+    except Exception:
+        pass
+    time.sleep(1.0)
+    return False
+
+
 def solve_activity(
     driver: WebDriver,
     activity_url: str,
@@ -662,6 +732,8 @@ def solve_activity(
 
     # Handle purely non-scorable presentation activities (e.g., Listening 2)
     if all(s.get("isPresentation") for s in steps_spec):
+        if activity_budget_sec > 0:
+            _paced_sleep(driver, activity_budget_sec)
         driver.switch_to.default_content()
         clicked_next = driver.execute_script(
             """
@@ -676,7 +748,8 @@ def solve_activity(
             return false;
             """
         )
-        time.sleep(1.5)
+        time.sleep(1.0)
+        _close_activity_cleanly(driver)
         if not quiet_logs:
             print(f"[solver] Completed presentation item ({'clicked NEXT ACTIVITY' if clicked_next else 'viewed'})")
         return (0, 0)
@@ -785,14 +858,14 @@ def solve_activity(
                 step_base = activity_budget_sec / scorable_count
                 pre_check_wait = random.uniform(step_base * 0.45, step_base * 0.95)
                 post_check_wait = random.uniform(step_base * 0.15, step_base * 0.45)
-                time.sleep(max(0.2, pre_check_wait))
+                _paced_sleep(driver, max(0.2, pre_check_wait))
             else:
                 post_check_wait = 0.0
 
             _click_outer_button(driver, 'a.btn.green-btn[title="Check"]')
             verify_step_100_after_check(driver, step_idx)
             if post_check_wait > 0:
-                time.sleep(max(0.15, post_check_wait))
+                _paced_sleep(driver, max(0.15, post_check_wait))
             _click_outer_button(driver, 'a.btn.green-btn[title="Next"]')
 
             # Wait briefly for transition to next step or completion view.
@@ -829,8 +902,10 @@ def solve_activity(
         scored, total = verify_final_score_100(driver, timeout=20.0)
         break
 
-    # Allow xAPI and progress state POST requests to flush cleanly before leaving page.
-    time.sleep(1.5)
+    # Close activity cleanly via Angular route guard so closeLO() + flushStateAndStatements()
+    # publish the accumulated localStorage timespent and xAPI statements before leaving.
+    time.sleep(0.8)
+    _close_activity_cleanly(driver)
     if not quiet_logs:
         print(
             f"[solver] Verified 100% ({scored}/{total}, steps={scorable_count}): {label}"
