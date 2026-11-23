@@ -22,7 +22,6 @@ LOGIN_URL = f"{BASE_URL}/login"
 DASHBOARD_URL = f"{BASE_URL}/dashboard/learner/dashboard"
 
 DEFAULT_ORG_ID = "org_cup_ee0u5bQ0JEkCYszI69cPi"
-DEFAULT_CLASS_ID = "449ab333-8e4a-4d3b-ab1a-2fd780e29278"
 DEFAULT_PRODUCT_CODE = "empbe2ednl5dw"
 
 # 40 Learning Object IDs in Homework Eng3, Unit 6 - 9 (Lesson A x4, Lesson B x4, Lesson D x2)
@@ -123,7 +122,7 @@ class CambridgeSession:
         self.session_dir = session_dir or build_session_dir(self.username)
         self.driver: WebDriver | None = None
         self.org_id: str = DEFAULT_ORG_ID
-        self.class_id: str = DEFAULT_CLASS_ID
+        self.class_id: str = ""
         self.product_code: str = DEFAULT_PRODUCT_CODE
 
     def __enter__(self) -> "CambridgeSession":
@@ -221,7 +220,17 @@ class CambridgeSession:
                 try:
                     WebDriverWait(self.driver, 20).until(
                         lambda d: d.execute_script(
-                            "return Boolean(document.querySelector('a[href*=\"/assignments\"], .card, [class*=\"course\"]'));"
+                            """
+                            if (document.querySelector('a[href*="/resourcebank/"], a[href*="/class/learner/"][href*="/assignments"]')) {
+                                return true;
+                            }
+                            for (const el of document.querySelectorAll('a, button')) {
+                                if (/^My assignments\\b/i.test((el.textContent || '').trim()) && el.offsetParent !== null) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                            """
                         )
                     )
                 except TimeoutException:
@@ -250,35 +259,112 @@ class CambridgeSession:
 
         raise LoginError(f"Timed out waiting for learner dashboard redirect (url={self.driver.current_url})")
 
-    def _detect_active_course_context(self) -> None:
-        """Extract orgId and classId for the active class from the dashboard."""
+    def _detect_active_course_context(self, timeout: float = 15.0) -> None:
+        """Extract orgId and classId for the active ENG4 class from the dashboard."""
         assert self.driver is not None
-        ctx = self.driver.execute_script(
-            """
-            const links = Array.from(document.querySelectorAll('a[href*="/class/learner/"][href*="/assignments"]'));
-            for (const a of links) {
+
+        extract_js = """
+            function getCardInfo(el) {
+                let container = el;
+                let isEnded = false;
+                let isEng4 = false;
+                for (let i = 0; i < 8 && container; i++) {
+                    const txt = container.innerText || '';
+                    if (txt.includes('Class ended')) {
+                        isEnded = true;
+                        break;
+                    }
+                    if (/Upper Intermediate|Eng\\s*4|emp2l5|empbe2ednl5dw/i.test(txt)) {
+                        isEng4 = true;
+                    }
+                    container = container.parentElement;
+                }
+                return { isEnded, isEng4 };
+            }
+
+            const candidates = [];
+
+            for (const a of document.querySelectorAll('a[href*="/class/learner/"][href*="/assignments"]')) {
                 const href = a.getAttribute('href') || '';
                 const m = href.match(/\\/class\\/learner\\/([^/]+)\\/class\\/([^/]+)\\/assignments/);
                 if (!m) continue;
-                let container = a;
+                const info = getCardInfo(a);
+                if (!info.isEnded) {
+                    candidates.push({ orgId: m[1], classId: m[2], priority: info.isEng4 ? 4 : 3 });
+                }
+            }
+
+            for (const a of document.querySelectorAll('a[href*="/resourcebank/"]')) {
+                const href = a.getAttribute('href') || '';
+                const m = href.match(/\\/dashboard\\/learner\\/([^/]+)\\/resourcebank\\/([^/]+)\\/([^/?#]+)/);
+                if (!m) continue;
+                const info = getCardInfo(a);
+                if (!info.isEnded) {
+                    const resIsEng4 = /emp2l5/i.test(m[2]) || info.isEng4;
+                    candidates.push({ orgId: m[1], classId: m[3], priority: resIsEng4 ? 2 : 1 });
+                }
+            }
+
+            if (candidates.length === 0) return null;
+            candidates.sort((a, b) => b.priority - a.priority);
+            return { orgId: candidates[0].orgId, classId: candidates[0].classId };
+        """
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ctx = self.driver.execute_script(extract_js)
+            if ctx and ctx.get("orgId") and ctx.get("classId"):
+                self.org_id = ctx["orgId"]
+                self.class_id = ctx["classId"]
+                if not self.quiet_logs:
+                    print(f"[session] Detected active class context: class_id={self.class_id}")
+                return
+            time.sleep(0.4)
+
+        # Fallback: click the active class's "My assignments" button/link and read URL.
+        clicked = self.driver.execute_script(
+            """
+            const candidates = [];
+            for (const el of document.querySelectorAll('a, button')) {
+                const txt = (el.textContent || '').trim();
+                if (!/^My assignments\\b/i.test(txt) || el.offsetParent === null) continue;
+                let container = el;
                 let isEnded = false;
+                let isEng4 = false;
                 for (let i = 0; i < 8 && container; i++) {
-                    if ((container.innerText || '').includes('Class ended')) {
+                    const ctxt = container.innerText || '';
+                    if (ctxt.includes('Class ended')) {
                         isEnded = true;
                         break;
+                    }
+                    if (/Upper Intermediate|Eng\\s*4/i.test(ctxt)) {
+                        isEng4 = true;
                     }
                     container = container.parentElement;
                 }
                 if (!isEnded) {
-                    return { orgId: m[1], classId: m[2] };
+                    candidates.push({ el, priority: isEng4 ? 2 : 1 });
                 }
             }
-            return null;
+            if (candidates.length === 0) return false;
+            candidates.sort((a, b) => b.priority - a.priority);
+            candidates[0].el.click();
+            return true;
             """
         )
-        if ctx and ctx.get("orgId") and ctx.get("classId"):
-            self.org_id = ctx["orgId"]
-            self.class_id = ctx["classId"]
+        if clicked:
+            url_deadline = time.monotonic() + 12.0
+            while time.monotonic() < url_deadline:
+                m = re.search(r"/class/learner/([^/]+)/class/([^/]+)/assignments", self.driver.current_url or "")
+                if m:
+                    self.org_id = m.group(1)
+                    self.class_id = m.group(2)
+                    if not self.quiet_logs:
+                        print(f"[session] Detected active class via redirect: class_id={self.class_id}")
+                    return
+                time.sleep(0.3)
+
+        raise RuntimeError("Could not detect active classId on Cambridge One learner dashboard")
 
     def _read_assignments_status(self) -> dict[str, dict[str, str]]:
         """Read assignment item scores from My assignments page keyed by normalized title."""
