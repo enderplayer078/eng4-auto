@@ -32,6 +32,8 @@ RTDB_SCOPES = (
 
 ASSIGNMENT_TOTAL = 40
 MAX_JOBS_PER_RUN = 15
+STALE_JOB_MS = 240 * 60 * 1000
+MAX_HISTORY_JOBS = 100
 
 
 class RTDBClient:
@@ -192,6 +194,46 @@ def _claim_next_job(db: RTDBClient) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def _cleanup_stale_public_jobs(db: RTDBClient) -> None:
+    """Mark abandoned queued/running public jobs as failed and bound history size."""
+    try:
+        queue = db.get("public/queue")
+    except Exception:
+        return
+    if not isinstance(queue, dict) or not queue:
+        return
+
+    now = _now_ms()
+    history_items: list[tuple[str, int]] = []
+    for job_id, item in queue.items():
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "")
+        updated_at = int(item.get("updatedAt") or item.get("createdAt") or 0)
+        if status in ("queued", "running") and updated_at > 0 and (now - updated_at) > STALE_JOB_MS:
+            try:
+                db.patch(
+                    f"public/queue/{job_id}",
+                    {
+                        "status": "failed",
+                        "error": "Timed out",
+                        "updatedAt": now,
+                    },
+                )
+            except Exception:
+                pass
+        elif status in ("completed", "failed"):
+            history_items.append((job_id, updated_at))
+
+    if len(history_items) > MAX_HISTORY_JOBS:
+        history_items.sort(key=lambda kv: kv[1], reverse=True)
+        for old_id, _ts in history_items[MAX_HISTORY_JOBS:]:
+            try:
+                db.delete(f"public/queue/{old_id}")
+            except Exception:
+                pass
+
+
 def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str, Any]) -> None:
     user_key = str(ticket["userKey"])
     scope = str(ticket.get("scope") or "assignments")
@@ -227,21 +269,16 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
         print("[worker] Job failed: payload decryption error")
         return
 
-    def _on_progress(done_in_run: int, total_in_run: int) -> None:
-        if scope == "assignments":
-            already_done = max(0, ASSIGNMENT_TOTAL - total_in_run)
-            overall_done = min(ASSIGNMENT_TOTAL, already_done + done_in_run)
-            overall_total = ASSIGNMENT_TOTAL
-        else:
-            overall_done = done_in_run
-            overall_total = total_in_run or display_total
+    def _on_progress(overall_done: int, overall_total: int) -> None:
+        safe_total = max(1, int(overall_total or display_total))
+        safe_done = min(safe_total, max(0, int(overall_done or 0)))
         try:
             db.patch(
                 f"public/queue/{job_id}",
                 {
                     "status": "running",
-                    "done": overall_done,
-                    "total": overall_total,
+                    "done": safe_done,
+                    "total": safe_total,
                     "updatedAt": _now_ms(),
                 },
             )
@@ -257,37 +294,75 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
         min_minutes, max_minutes = 20.0, 40.0
 
     try:
+        max_units = max(0, min(10, int(ticket.get("maxUnits") or 0)))
+    except (TypeError, ValueError):
+        max_units = 0
+
+    try:
+        max_activities = max(0, min(200, int(ticket.get("maxActivities") or 0)))
+    except (TypeError, ValueError):
+        max_activities = 0
+
+    try:
         summary = run_for_account(
             username=username,
             password=password,
             scope=scope,
+            max_units=max_units,
+            max_activities=max_activities,
             headless=True,
             quiet_logs=True,
             on_progress=_on_progress,
             min_total_minutes=min_minutes,
             max_total_minutes=max_minutes,
         )
-        final_total = ASSIGNMENT_TOTAL if scope == "assignments" else max(summary.get("total", 0), 1)
+        final_total = max(int(summary.get("total", display_total) or display_total), 1)
+        is_all_done = bool(summary.get("all_completed", False))
+        final_done = min(
+            final_total,
+            max(0, int(summary.get("completed", final_total if is_all_done else 0))),
+        )
         now = _now_ms()
-        db.put(
-            f"private/completed/{user_key}",
-            {
-                "completedAt": now,
-                "total": final_total,
-            },
-        )
         db.delete(f"private/active/{user_key}")
-        db.patch(
-            f"public/queue/{job_id}",
-            {
-                "status": "completed",
-                "done": final_total,
-                "total": final_total,
-                "updatedAt": now,
-            },
-        )
-        db.increment_completed_count()
-        print("[worker] Job completed at 100%")
+
+        if is_all_done:
+            already_recorded = False
+            try:
+                already_recorded = db.get(f"private/completed/{user_key}") is not None
+            except Exception:
+                already_recorded = False
+            db.put(
+                f"private/completed/{user_key}",
+                {
+                    "completedAt": now,
+                    "total": final_total,
+                },
+            )
+            db.patch(
+                f"public/queue/{job_id}",
+                {
+                    "status": "completed",
+                    "done": final_total,
+                    "total": final_total,
+                    "partial": False,
+                    "updatedAt": now,
+                },
+            )
+            if not already_recorded:
+                db.increment_completed_count()
+            print("[worker] Job completed at 100%")
+        else:
+            db.patch(
+                f"public/queue/{job_id}",
+                {
+                    "status": "completed",
+                    "done": final_done,
+                    "total": final_total,
+                    "partial": True,
+                    "updatedAt": now,
+                },
+            )
+            print(f"[worker] Partial run finished ({final_done}/{final_total})")
     except LoginError:
         db.delete(f"private/active/{user_key}")
         db.patch(
@@ -333,6 +408,7 @@ def main() -> int:
     sa_info = json.loads(sa_raw)
     private_key = _load_private_key()
     db = RTDBClient(rtdb_base, sa_info)
+    _cleanup_stale_public_jobs(db)
 
     processed = 0
     run_start = time.monotonic()

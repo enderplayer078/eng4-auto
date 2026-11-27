@@ -33,8 +33,9 @@ def _build_activity_budgets(
     targets: list,
     min_total_minutes: float,
     max_total_minutes: float,
+    total_course_count: int = 40,
 ) -> list[float]:
-    """Allocate randomized per-activity pacing budgets targeting 20-40 min total for 40 items."""
+    """Allocate randomized per-activity pacing budgets scaled proportionally to course size."""
     count = len(targets)
     if count == 0 or max_total_minutes <= 0:
         return [0.0] * count
@@ -42,8 +43,9 @@ def _build_activity_budgets(
     low = max(0.0, min(min_total_minutes, max_total_minutes))
     high = max(low, max_total_minutes)
     target_full_sec = random.uniform(low, high) * 60.0
-    # Scale proportionally when fewer/more than 40 activities are queued
-    scaled_total_sec = target_full_sec * (count / 40.0)
+    # Scale proportionally relative to the full course activity count
+    denom = float(max(1, total_course_count))
+    scaled_total_sec = target_full_sec * (count / denom)
     # Cambridge One records active time in 10s floor ticks (accTimeUnit=10) only
     # after the activity iframe launches (~3.5s active solve/check overhead vs
     # ~5.0s average floor quantization loss -> +1.5s compensation per activity).
@@ -65,20 +67,21 @@ def run_for_account(
     scope: str = "assignments",
     units: list[int] | None = None,
     limit: int | None = None,
+    max_units: int = 0,
+    max_activities: int = 0,
     include_completed: bool = False,
     headless: bool = True,
     quiet_logs: bool = False,
     on_progress: Callable[[int, int], None] | None = None,
     min_total_minutes: float = 20.0,
     max_total_minutes: float = 40.0,
-) -> dict[str, int]:
-    """Log into Cambridge One and complete all target activities at 100%."""
+) -> dict[str, int | bool]:
+    """Log into Cambridge One and complete target activities at 100%."""
     session_dir = build_session_dir(username)
     session: CambridgeSession | None = None
 
     completed = 0
     skipped = 0
-    total = 0
 
     try:
         session = CambridgeSession(
@@ -90,26 +93,56 @@ def run_for_account(
         driver = session.start()
         session.login(password)
 
-        targets = session.discover_course_targets(
+        all_targets = session.discover_course_targets(
             scope=scope,
             units=units,
-            include_completed=include_completed,
+            include_completed=True,
         )
-        if limit is not None and limit > 0:
-            targets = targets[:limit]
-
-        total = len(targets)
-        if not quiet_logs:
-            print(f"[runner] Found {total} target activities (scope={scope})")
+        total_all = len(all_targets)
+        if include_completed:
+            already_done = 0
+            remaining_targets = list(all_targets)
         else:
-            print(f"[runner] Queued {total} activities")
+            already_done = sum(1 for t in all_targets if t.already_100)
+            remaining_targets = [t for t in all_targets if not t.already_100]
+
+        selected = list(remaining_targets)
+        if max_units > 0 and selected:
+            ordered_unit_nums: list[int] = []
+            for t in selected:
+                if t.unit_num not in ordered_unit_nums:
+                    ordered_unit_nums.append(t.unit_num)
+            allowed_units = set(ordered_unit_nums[:max_units])
+            selected = [t for t in selected if t.unit_num in allowed_units]
+
+        if max_activities > 0:
+            selected = selected[:max_activities]
+        if limit is not None and limit > 0:
+            selected = selected[:limit]
+
+        is_partial_selection = len(selected) < len(remaining_targets)
+        progress_total = total_all if total_all > 0 else len(selected)
+        run_count = len(selected)
+
+        if not quiet_logs:
+            print(
+                f"[runner] Found {run_count} target activities "
+                f"(already_done={already_done}, total={progress_total}, scope={scope})"
+            )
+        else:
+            print(f"[runner] Queued {run_count} activities (total={progress_total})")
 
         if on_progress:
-            on_progress(0, total)
+            on_progress(already_done, progress_total)
 
-        budgets = _build_activity_budgets(targets, min_total_minutes, max_total_minutes)
+        budgets = _build_activity_budgets(
+            selected,
+            min_total_minutes,
+            max_total_minutes,
+            total_course_count=progress_total or 40,
+        )
 
-        for idx, (target, budget_sec) in enumerate(zip(targets, budgets), start=1):
+        for idx, (target, budget_sec) in enumerate(zip(selected, budgets), start=1):
             result = solve_activity(
                 driver=driver,
                 activity_url=target.activity_url,
@@ -122,21 +155,27 @@ def run_for_account(
             else:
                 completed += 1
 
+            overall_done = min(progress_total, already_done + idx)
             if on_progress:
-                on_progress(idx, total)
+                on_progress(overall_done, progress_total)
 
             if quiet_logs:
-                print(f"[runner] Progress: {idx}/{total}")
+                print(f"[runner] Progress: {overall_done}/{progress_total}")
             else:
                 print(
-                    f"[runner] Progress: {idx}/{total} "
+                    f"[runner] Progress: {overall_done}/{progress_total} "
                     f"(completed={completed}, skipped={skipped})"
                 )
 
+        final_done = min(progress_total, already_done + completed)
+        all_completed = (not is_partial_selection) and (skipped == 0) and (final_done >= progress_total)
         return {
-            "total": total,
-            "completed": completed,
+            "total": progress_total,
+            "completed": final_done,
+            "ran_this_session": completed,
             "skipped": skipped,
+            "all_completed": all_completed,
+            "partial": not all_completed,
         }
     finally:
         if session is not None:
@@ -166,6 +205,18 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Optional max number of activities to run",
+    )
+    parser.add_argument(
+        "--max-units",
+        type=int,
+        default=0,
+        help="Optional max number of incomplete units to process (0 = all)",
+    )
+    parser.add_argument(
+        "--max-activities",
+        type=int,
+        default=0,
+        help="Optional max number of activities to process (0 = all)",
     )
     parser.add_argument(
         "--include-completed",
@@ -205,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
         scope=args.scope,
         units=units,
         limit=args.limit,
+        max_units=max(0, args.max_units),
+        max_activities=max(0, args.max_activities),
         include_completed=args.include_completed,
         headless=args.headless,
         quiet_logs=args.quiet,
